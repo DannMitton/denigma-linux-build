@@ -1,0 +1,208 @@
+# denigma diff test: does disabling fontconfig change the MNX output?
+#
+# Builds denigma TWICE from the same v3.1 source and converts the same scores
+# with each binary, then diffs the MNX. The only variable we care about is
+# fontconfig:
+#   variant A  fontconfig OFF (FreeType directory-index fallback), fully static.
+#              The binary Shane would actually ship; built exactly as in
+#              DannMitton/denigma-linux-build/.github/workflows/build.yml.
+#   variant B  fontconfig ON, ordinary dynamic link. Patterson's own Ubuntu
+#              recipe; the reference output.
+# Decision rule (locked consensus): drop fontconfig for good only if every diff
+# is empty or trivial. A dirty diff sends the drafted question to Patterson.
+#
+# Note on the one confound: A is static-and-fontconfig-off, B is
+# dynamic-and-fontconfig-on, so the two binaries differ in BOTH link mode and
+# fontconfig. Link mode does not affect emitted MNX (MNX content is a function
+# of the score data and text-metrics resolution, not of how the runtime is
+# linked), so any diff is attributable to fontconfig. Building a static
+# fontconfig-on B would remove the confound but needs static expat/etc.; not
+# worth it for a content diff.
+#
+# denigma CLI grounded in the v3.1 source (usage examples in
+# src/export/export.cpp; help in src/main.cpp): the export command picks the
+# output format with a format FLAG, e.g.
+#     denigma export input.musx --mnx output.mnx
+#   --pretty-print  makes the MNX line-diffable
+#   --force         overwrites an existing output
+#   default input format is .musx (export.h defaultInputFormat == MUSX_EXTENSION)
+#
+# Two checkouts: THIS repo supplies samples/ (the Verdi and Kabalevsky scores);
+# rpatters1/denigma supplies the source and example_sources/ (the simple tier).
+
+name: denigma diff test (fontconfig off vs on)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diff:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out this repo (samples/ lives here)
+        uses: actions/checkout@v4
+        with:
+          path: self
+
+      - name: Check out denigma at the v3.1 tag (source + example_sources/)
+        uses: actions/checkout@v4
+        with:
+          repository: rpatters1/denigma
+          ref: v3.1
+          submodules: recursive
+          fetch-depth: 0
+          path: denigma-src
+
+      - name: Install build tools (incl. libfontconfig1-dev for variant B)
+        run: sudo apt-get update && sudo apt-get install -y ninja-build xxd libfontconfig1-dev
+
+      - name: Show toolchain
+        run: |
+          cmake --version
+          ninja --version
+          c++ --version
+
+      # ---- variant B first: fontconfig ON, -Werror left intact (compiles clean) ----
+      - name: Configure variant B (fontconfig ON, dynamic; Patterson's recipe)
+        working-directory: denigma-src
+        run: |
+          set -eo pipefail
+          cmake -G Ninja -S . -B build-b \
+            -DCMAKE_BUILD_TYPE=Release \
+            2>&1 | tee ../configure-b.log
+
+      - name: Assert variant B really has fontconfig ON
+        run: |
+          set -eo pipefail
+          if grep -q "Text metrics resolver enabled: fontconfig" configure-b.log; then
+            echo "OK: variant B has fontconfig enabled."
+          else
+            echo "WARN: did not see the fontconfig-enabled line; inspect configure-b.log."
+            grep -i fontconfig configure-b.log || true
+          fi
+
+      - name: Build variant B
+        working-directory: denigma-src
+        run: cmake --build build-b --parallel 2
+
+      # ---- variant A: fontconfig OFF, fully static (the shippable binary) ----
+      - name: Allow the fontconfig-off build to compile (drop -Werror)
+        working-directory: denigma-src
+        run: |
+          set -eo pipefail
+          # With fontconfig off, resolveWithNativeLocked()'s parameters are unused
+          # on Linux and -Werror=unused-parameter turns that into a hard error.
+          # Two sites: top-level CMakeLists.txt and tests/CMakeLists.txt.
+          sed -i 's/ -Werror//g' CMakeLists.txt tests/CMakeLists.txt
+          if grep -rn -- '-Werror' CMakeLists.txt tests/CMakeLists.txt; then
+            echo "FAIL: -Werror still present after patch; a line may have changed upstream."
+            exit 1
+          fi
+          echo "OK: -Werror removed for the fontconfig-off build (warnings remain, non-fatal)."
+
+      - name: Configure variant A (fontconfig OFF, static)
+        working-directory: denigma-src
+        run: |
+          set -eo pipefail
+          cmake -G Ninja -S . -B build-a \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDENIGMA_FONTCONFIG_INCLUDE_DIR=IGNORE \
+            -DDENIGMA_FONTCONFIG_LIBRARY=IGNORE \
+            -DCMAKE_EXE_LINKER_FLAGS="-static -static-libstdc++ -static-libgcc" \
+            2>&1 | tee ../configure-a.log
+
+      - name: Assert variant A really has fontconfig OFF
+        run: |
+          set -eo pipefail
+          if grep -q "Text metrics resolver enabled: fontconfig" configure-a.log; then
+            echo "FAIL: fontconfig was enabled in variant A; not the shippable config."; exit 1
+          fi
+          if grep -q "DENIGMA_FONTCONFIG_LIBRARY:FILEPATH=/" denigma-src/build-a/CMakeCache.txt; then
+            echo "FAIL: fontconfig library resolved to a real path in A."; exit 1
+          fi
+          echo "OK: variant A fontconfig disabled (FreeType fallback)."
+
+      - name: Build variant A
+        working-directory: denigma-src
+        run: cmake --build build-a --parallel 2
+
+      - name: Locate both binaries
+        id: bins
+        run: |
+          set -eo pipefail
+          A=$(find denigma-src/build-a -type f -name denigma | head -n1)
+          B=$(find denigma-src/build-b -type f -name denigma | head -n1)
+          [ -n "$A" ] || { echo "FAIL: variant A binary not found"; exit 1; }
+          [ -n "$B" ] || { echo "FAIL: variant B binary not found"; exit 1; }
+          echo "bin_a=$A" >> "$GITHUB_OUTPUT"
+          echo "bin_b=$B" >> "$GITHUB_OUTPUT"
+          echo "== variant A =="; file "$A"; ldd "$A" || true; "$A" --version || true
+          echo "== variant B =="; file "$B"; "$B" --version || true
+
+      - name: Convert each tier with both variants and diff the MNX
+        id: diff
+        run: |
+          set -uo pipefail
+          A="${{ steps.bins.outputs.bin_a }}"
+          B="${{ steps.bins.outputs.bin_b }}"
+          mkdir -p out/mnx_a out/mnx_b out/diffs
+
+          # Build the sample list: "tier|path".
+          SAMPLES=()
+          shopt -s nullglob
+          for f in denigma-src/example_sources/mnx-w3c/*.musx; do
+            SAMPLES+=("simple|$f")
+          done
+          shopt -u nullglob
+          SAMPLES+=("moderate|self/samples/Verdi_-_Simon_Boccanegra_-_Il_lacerato_spirito.musx")
+          SAMPLES+=("stress|self/samples/Kabalevsky_-_Shakespeare_-_T08_No_longer_mourn_for_me_when_I_am_dead.musx")
+
+          printf "%-10s %-52s %s\n" "TIER" "SAMPLE" "MNX LINES CHANGED" | tee out/summary.txt
+          printf "%-10s %-52s %s\n" "----" "------" "-----------------" | tee -a out/summary.txt
+
+          any_dirty=0
+          for entry in "${SAMPLES[@]}"; do
+            tier="${entry%%|*}"; src="${entry#*|}"
+            base="$(basename "$src" .musx)"
+            if [ ! -e "$src" ]; then
+              printf "%-10s %-52s %s\n" "$tier" "$base" "MISSING INPUT" | tee -a out/summary.txt
+              any_dirty=1; continue
+            fi
+            # Identical command for both binaries; only the binary differs.
+            "$A" export "$src" --mnx "out/mnx_a/$base.mnx" --pretty-print --force > "out/mnx_a/$base.log" 2>&1 || true
+            "$B" export "$src" --mnx "out/mnx_b/$base.mnx" --pretty-print --force > "out/mnx_b/$base.log" 2>&1 || true
+            if [ -e "out/mnx_a/$base.mnx" ] && [ -e "out/mnx_b/$base.mnx" ]; then
+              diff -u "out/mnx_b/$base.mnx" "out/mnx_a/$base.mnx" > "out/diffs/$base.diff" || true
+              n=$(grep -cE '^[+-]' "out/diffs/$base.diff" || true)
+              [ "$n" -ge 2 ] && n=$((n - 2))   # discount the --- / +++ header lines
+              printf "%-10s %-52s %s\n" "$tier" "$base" "$n" | tee -a out/summary.txt
+              [ "$n" -gt 0 ] && any_dirty=1
+            else
+              printf "%-10s %-52s %s\n" "$tier" "$base" "NO MNX (see logs)" | tee -a out/summary.txt
+              any_dirty=1
+            fi
+          done
+
+          echo "" | tee -a out/summary.txt
+          if [ "$any_dirty" -eq 0 ]; then
+            echo "RESULT: every diff empty. fontconfig-off matches fontconfig-on on all tiers." | tee -a out/summary.txt
+          else
+            echo "RESULT: at least one tier differs or failed to convert; inspect out/diffs and the per-file logs." | tee -a out/summary.txt
+          fi
+
+      - name: Upload MNX outputs, diffs, logs, and the summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: denigma-diff-results
+          path: |
+            out/
+            configure-a.log
+            configure-b.log
+          if-no-files-found: error
+
+      - name: Upload the shippable static binary (variant A)
+        uses: actions/upload-artifact@v4
+        with:
+          name: denigma-linux-static
+          path: ${{ steps.bins.outputs.bin_a }}
+          if-no-files-found: error
