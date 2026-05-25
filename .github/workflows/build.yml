@@ -1,0 +1,107 @@
+# Build a fully static Linux denigma binary, with fontconfig disabled.
+#
+# Grounded in denigma's v3.1 source, read 2026-05-25. Why each non-obvious choice:
+#  - ref: v3.1   The tag is literally "v3.1", not "v3.1.0". It already carries the
+#                fixed-hash dependency pins (mnxdom e7c947bf, musxdom 1064ccc5,
+#                smufl-mapping c144442). The commented-out "release" block in
+#                cmake/Dependencies.cmake floats smufl at main and is less
+#                reproducible, so we build the tag as it stands and edit nothing.
+#  - fontconfig  denigma detects fontconfig with find_path/find_library (not
+#                find_package) and offers no on/off option. Pre-seeding both cache
+#                variables to CMake's IGNORE sentinel forces the disabled branch
+#                (FreeType directory-index fallback) without editing source or
+#                touching the runner's packages. The "Assert variant A" step proves
+#                it stayed disabled rather than trusting it did.
+#  - -static ... fully static C and C++ runtime, so the binary carries no glibc
+#                version dependency and can run on Vercel's Amazon Linux.
+#  - find ...    the binary lands at build/build/Release/denigma (a
+#                RUNTIME_OUTPUT_DIRECTORY override in denigma's CMakeLists), so we
+#                locate it rather than assume build/denigma.
+
+name: Build denigma (Linux, static, no fontconfig)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out denigma at the v3.1 tag
+        uses: actions/checkout@v4
+        with:
+          repository: rpatters1/denigma
+          ref: v3.1
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install build tools (ninja, xxd; deliberately NOT fontconfig)
+        run: sudo apt-get update && sudo apt-get install -y ninja-build xxd
+
+      - name: Show toolchain
+        run: |
+          cmake --version
+          ninja --version
+          c++ --version
+
+      - name: Configure (static link, fontconfig disabled)
+        run: |
+          set -eo pipefail
+          cmake -G Ninja -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDENIGMA_FONTCONFIG_INCLUDE_DIR=IGNORE \
+            -DDENIGMA_FONTCONFIG_LIBRARY=IGNORE \
+            -DCMAKE_EXE_LINKER_FLAGS="-static -static-libstdc++ -static-libgcc" \
+            2>&1 | tee configure.log
+
+      - name: Assert variant A (fontconfig really is disabled)
+        run: |
+          set -eo pipefail
+          echo "--- fontconfig cache values ---"
+          grep DENIGMA_FONTCONFIG build/CMakeCache.txt || true
+          if grep -q "Text metrics resolver enabled: fontconfig" configure.log; then
+            echo "FAIL: fontconfig was enabled; this is not variant A."; exit 1
+          fi
+          if grep -q "DENIGMA_FONTCONFIG_LIBRARY:FILEPATH=/" build/CMakeCache.txt; then
+            echo "FAIL: fontconfig library resolved to a real path; not variant A."; exit 1
+          fi
+          echo "OK: fontconfig disabled, FreeType fallback in use (variant A)."
+
+      - name: Build
+        run: cmake --build build --parallel 2
+
+      - name: Locate the binary
+        id: locate
+        run: |
+          set -eo pipefail
+          BIN=$(find build -type f -name denigma | head -n1)
+          if [ -z "$BIN" ]; then
+            echo "FAIL: denigma binary not found under build/."
+            find build -name 'denigma*'
+            exit 1
+          fi
+          echo "bin=$BIN" >> "$GITHUB_OUTPUT"
+          echo "Located: $BIN"
+
+      - name: Verify the static link (the central question)
+        run: |
+          set -eo pipefail
+          BIN="${{ steps.locate.outputs.bin }}"
+          echo "== file =="
+          file "$BIN"
+          echo "== ldd (a fully static binary reports 'not a dynamic executable') =="
+          ldd "$BIN" || true
+          echo "== run =="
+          "$BIN" --version || true
+
+      - name: Upload the binary (saved before tests, so it survives a test failure)
+        uses: actions/upload-artifact@v4
+        with:
+          name: denigma-linux-static
+          path: ${{ steps.locate.outputs.bin }}
+          if-no-files-found: error
+
+      - name: Run denigma's own test suite
+        run: ctest --test-dir build/tests --output-on-failure
