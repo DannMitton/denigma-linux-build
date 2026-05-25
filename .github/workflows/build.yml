@@ -5,7 +5,16 @@
 #                fixed-hash dependency pins (mnxdom e7c947bf, musxdom 1064ccc5,
 #                smufl-mapping c144442). The commented-out "release" block in
 #                cmake/Dependencies.cmake floats smufl at main and is less
-#                reproducible, so we build the tag as it stands and edit nothing.
+#                reproducible, so we build the tag as it stands and edit nothing
+#                in the dependency pins.
+#  - drop -Werror denigma's CMakeLists sets add_compile_options(... -Werror)
+#                globally. With fontconfig disabled, resolveWithNativeLocked()'s
+#                parameters (familyName, bold, italic) are unused on Linux, so
+#                -Werror=unused-parameter turns a harmless unused parameter into a
+#                hard error. Patterson never hits this because his CI always builds
+#                with fontconfig on. We strip -Werror (keeping -Wall -Wextra
+#                -Wpedantic, so warnings still print) so the fontconfig-off build
+#                can complete. This changes warning fatality only, not emitted code.
 #  - fontconfig  denigma detects fontconfig with find_path/find_library (not
 #                find_package) and offers no on/off option. Pre-seeding both cache
 #                variables to CMake's IGNORE sentinel forces the disabled branch
@@ -45,6 +54,17 @@ jobs:
           cmake --version
           ninja --version
           c++ --version
+
+      - name: Allow the fontconfig-off build to compile (drop -Werror)
+        run: |
+          set -eo pipefail
+          sed -i 's/add_compile_options(-Wall -Wextra -Wpedantic -Werror)/add_compile_options(-Wall -Wextra -Wpedantic)/' CMakeLists.txt
+          if grep -q -- '-Werror' CMakeLists.txt; then
+            echo "FAIL: -Werror still present after patch; the line may have changed upstream."
+            grep -n -- '-Werror' CMakeLists.txt
+            exit 1
+          fi
+          echo "OK: -Werror removed for this build (warnings remain, non-fatal)."
 
       - name: Configure (static link, fontconfig disabled)
         run: |
