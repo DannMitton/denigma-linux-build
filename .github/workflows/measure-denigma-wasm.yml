@@ -1,0 +1,124 @@
+# Measure denigma WASM example: build it, smoke-test it, report sizes.
+#
+# WHAT THIS DOES
+#   1. Installs the Emscripten SDK (the toolchain that compiles C++ to WASM).
+#   2. Clones Patterson's denigma-examples repo.
+#   3. Runs his two documented build commands.
+#   4. Runs his node smoke test against the built-in sample.
+#   5. Optionally smoke-tests any .musx files you place in this repo's samples/.
+#   6. Prints raw and gzipped sizes of denigma_wasm_mnx.js and .wasm to the run
+#      summary. The GZIPPED .wasm size is the number that gates the decision.
+#
+# HOW TO USE (from a desktop, when you are back at it)
+#   - Save this file as .github/workflows/measure-denigma-wasm.yml in any repo
+#     you own (your denigma-linux-build repo is a natural home).
+#   - Commit and push.
+#   - In GitHub: Actions tab -> "Measure denigma WASM example" -> Run workflow.
+#   - When it finishes, open the run -> read the Summary for the size table.
+#   - Optional: drop your Verdi / Kabalevsky .musx into a samples/ folder in the
+#     repo first, and the smoke test will also run against them (a real-repertoire
+#     correctness signal). If samples/ is empty it just uses the built-in sample.
+#
+# NOTES
+#   - The build defaults to denigma's "main" branch, matching Patterson's example.
+#     To pin a specific commit instead, set DENIGMA_GIT_TAG below.
+#   - First run is slow (it compiles denigma and its dependencies to WASM);
+#     budget 15-40 minutes. This is a one-off measurement, not a hot path.
+
+name: Measure denigma WASM example
+
+on:
+  workflow_dispatch:
+    inputs:
+      denigma_ref:
+        description: "denigma git ref to build (branch, tag, or commit). Leave as 'main' to match Patterson's example."
+        required: false
+        default: "main"
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out this repo (for any optional samples/)
+        uses: actions/checkout@v4
+
+      - name: Install xxd (denigma embeds resources with it)
+        run: sudo apt-get update && sudo apt-get install -y xxd
+
+      - name: Clone denigma-examples
+        run: git clone --depth 1 https://github.com/rpatters1/denigma-examples.git
+
+      - name: Build the WASM example
+        run: |
+          set -euo pipefail
+
+          # Install and activate the Emscripten SDK.
+          git clone https://github.com/emscripten-core/emsdk.git
+          cd emsdk
+          ./emsdk install latest
+          ./emsdk activate latest
+          source ./emsdk_env.sh
+          cd ..
+
+          # Patterson's two documented build commands, with the chosen denigma ref.
+          cd denigma-examples
+          emcmake cmake -S . -B build-wasm \
+            -DDENIGMA_EXAMPLES_BUILD_WASM_MNX=ON \
+            -DDENIGMA_GIT_TAG="${{ github.event.inputs.denigma_ref }}"
+          cmake --build build-wasm --target denigma_wasm_mnx
+
+      - name: Report artifact sizes
+        run: |
+          set -euo pipefail
+          cd denigma-examples
+
+          JS="$(find build-wasm -name 'denigma_wasm_mnx.js'   | head -1)"
+          WASM="$(find build-wasm -name 'denigma_wasm_mnx.wasm' | head -1)"
+
+          js_raw=$(stat -c %s "$JS")
+          wasm_raw=$(stat -c %s "$WASM")
+          js_gz=$(gzip -9 -c "$JS"   | wc -c)
+          wasm_gz=$(gzip -9 -c "$WASM" | wc -c)
+
+          to_mb() { awk "BEGIN { printf \"%.2f\", $1 / 1048576 }"; }
+
+          {
+            echo "## denigma WASM artifact sizes"
+            echo ""
+            echo "denigma ref built: \`${{ github.event.inputs.denigma_ref }}\`"
+            echo ""
+            echo "| Artifact | Raw | Gzipped |"
+            echo "|---|---|---|"
+            echo "| denigma_wasm_mnx.wasm | $(to_mb $wasm_raw) MB | **$(to_mb $wasm_gz) MB** |"
+            echo "| denigma_wasm_mnx.js   | $(to_mb $js_raw) MB | $(to_mb $js_gz) MB |"
+            echo ""
+            echo "The **gzipped .wasm** figure is the browser download cost that gates the decision."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Smoke test (built-in sample)
+        run: |
+          set -euo pipefail
+          cd denigma-examples
+          node examples/wasm-mnx/test/smoke.mjs \
+            build-wasm/examples/wasm-mnx/denigma_wasm_mnx.js \
+            examples/wasm-mnx/test/data/sample.musx
+          echo "Built-in sample converted successfully." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Smoke test (your samples, if any)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          samples=(samples/*.musx)
+          if [ ${#samples[@]} -eq 0 ]; then
+            echo "No samples/*.musx in this repo; skipping real-repertoire test." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Real-repertoire smoke tests" >> "$GITHUB_STEP_SUMMARY"
+          for f in "${samples[@]}"; do
+            echo "Converting $f ..."
+            node denigma-examples/examples/wasm-mnx/test/smoke.mjs \
+              denigma-examples/build-wasm/examples/wasm-mnx/denigma_wasm_mnx.js \
+              "$f"
+            echo "- \`$f\`: converted" >> "$GITHUB_STEP_SUMMARY"
+          done
