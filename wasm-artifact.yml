@@ -1,0 +1,55 @@
+# Builds the denigma MNX WebAssembly example and uploads its two output files
+# (denigma_wasm_mnx.js + denigma_wasm_mnx.wasm) as a downloadable artifact.
+#
+# Place this file at .github/workflows/wasm-artifact.yml in a fork of
+# rpatters1/denigma-examples. It runs on the Actions tab ("Run workflow"), and
+# also auto-runs once when you first commit it. When the run finishes, open it
+# and download the "denigma-wasm-mnx" artifact: a zip holding the two files the
+# Vite proof needs.
+#
+# This builds denigma from the example's default source (rpatters1/denigma, main
+# branch). That is proof-grade only. Pinning the canonical project-attacca commit
+# is a separate later step, for the real Ilya integration, not for this throwaway
+# proof.
+
+name: WASM MNX artifact
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/wasm-artifact.yml
+
+permissions:
+  contents: read
+
+jobs:
+  wasm:
+    name: Build and upload denigma_wasm_mnx
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+
+      - name: Configure
+        run: |
+          emcmake cmake -S . -B build-wasm \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDENIGMA_EXAMPLES_BUILD_WASM_MNX=ON \
+            -DDENIGMA_EXAMPLES_BUILD_WASM_ENIGMAXML=OFF \
+            -DDENIGMA_EXAMPLES_BUILD_TEXT_EXPRESSION_CLASSIFIER=OFF
+
+      - name: Build
+        run: cmake --build build-wasm --target denigma_wasm_mnx --parallel 2
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: denigma-wasm-mnx
+          if-no-files-found: error
+          path: |
+            build-wasm/examples/wasm-mnx/denigma_wasm_mnx.js
+            build-wasm/examples/wasm-mnx/denigma_wasm_mnx.wasm
