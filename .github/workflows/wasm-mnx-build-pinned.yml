@@ -1,0 +1,66 @@
+# Builds the denigma MNX WebAssembly wrapper from a PINNED denigma commit and
+# uploads the two output files as a downloadable artifact.
+#
+# Source-of-record: project-attacca/denigma (named in Patterson's README), which
+# is not publicly accessible. Build source: rpatters1/denigma, Patterson's public
+# copy that his own examples build from, pinned to the fixed commit below.
+# Attribution: Robert G. Patterson, MIT. Only the build-source repo differs from
+# the source-of-record, because the source-of-record is private.
+#
+# Place at .github/workflows/wasm-mnx-build-pinned.yml, run from the Actions tab,
+# then download the "denigma-wasm-mnx-pinned" artifact.
+
+name: Build WASM MNX (pinned)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # The rpatters1/denigma commit the proof built against, and the first commit
+  # carrying the buffer-based MNX converter the WASM wrapper needs. The v3.1 tag
+  # does not contain it, so a main-line commit is required.
+  DENIGMA_COMMIT: 9221012b1996ce68ebf2509700e3f84975d8e921
+
+jobs:
+  wasm:
+    name: Build and upload pinned denigma_wasm_mnx
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the example source
+        run: git clone --depth 1 https://github.com/rpatters1/denigma-examples.git examples-src
+
+      - name: Get denigma, pinned to the fixed commit
+        run: |
+          git clone https://github.com/rpatters1/denigma.git denigma-src
+          git -C denigma-src checkout "$DENIGMA_COMMIT"
+          echo "denigma pinned to: $(git -C denigma-src rev-parse HEAD)"
+
+      - name: Set up Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+
+      - name: Configure
+        working-directory: examples-src
+        run: |
+          emcmake cmake -S . -B build-wasm \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDENIGMA_EXAMPLES_BUILD_WASM_MNX=ON \
+            -DDENIGMA_EXAMPLES_BUILD_WASM_ENIGMAXML=OFF \
+            -DDENIGMA_EXAMPLES_BUILD_TEXT_EXPRESSION_CLASSIFIER=OFF \
+            -DDENIGMA_SOURCE_DIR="${GITHUB_WORKSPACE}/denigma-src"
+
+      - name: Build
+        working-directory: examples-src
+        run: cmake --build build-wasm --target denigma_wasm_mnx --parallel 2
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: denigma-wasm-mnx-pinned
+          if-no-files-found: error
+          path: |
+            examples-src/build-wasm/examples/wasm-mnx/denigma_wasm_mnx.js
+            examples-src/build-wasm/examples/wasm-mnx/denigma_wasm_mnx.wasm
