@@ -1,0 +1,54 @@
+# Builds the denigma MNX WebAssembly example and uploads its two output files
+# (denigma_wasm_mnx.js + denigma_wasm_mnx.wasm) as a downloadable artifact.
+#
+# This version fetches Patterson's example itself and builds INSIDE it, which is
+# the fix for the earlier "source directory does not contain CMakeLists.txt"
+# error. It can live in any repository (e.g. DannMitton/denigma-linux-build).
+# Put it at .github/workflows/wasm-mnx-build.yml, then run it from the Actions
+# tab. Download the "denigma-wasm-mnx" artifact when it finishes.
+#
+# It builds denigma from the example's default source (rpatters1/denigma, main
+# branch). Proof-grade only; pinning the canonical project-attacca commit is a
+# separate later step.
+
+name: Build WASM MNX (v2)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wasm:
+    name: Build and upload denigma_wasm_mnx
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the example source
+        run: git clone --depth 1 https://github.com/rpatters1/denigma-examples.git src
+
+      - name: Set up Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+
+      - name: Configure
+        working-directory: src
+        run: |
+          emcmake cmake -S . -B build-wasm \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDENIGMA_EXAMPLES_BUILD_WASM_MNX=ON \
+            -DDENIGMA_EXAMPLES_BUILD_WASM_ENIGMAXML=OFF \
+            -DDENIGMA_EXAMPLES_BUILD_TEXT_EXPRESSION_CLASSIFIER=OFF
+
+      - name: Build
+        working-directory: src
+        run: cmake --build build-wasm --target denigma_wasm_mnx --parallel 2
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: denigma-wasm-mnx
+          if-no-files-found: error
+          path: |
+            src/build-wasm/examples/wasm-mnx/denigma_wasm_mnx.js
+            src/build-wasm/examples/wasm-mnx/denigma_wasm_mnx.wasm
