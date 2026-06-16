@@ -1,0 +1,214 @@
+# WASM-versus-CLI MNX diff (the merge gate).
+#
+# Question this answers: does Patterson's denigma WASM produce the SAME MNX as
+# the native CLI denigma, on the same scores, at the same pinned commit? If yes,
+# the WASM is safe to fold into Ilya. This is a MERGE blocker, not a decision
+# blocker.
+#
+# How it is built to be a fair comparison:
+#  - WASM side: the binaries you ALREADY built are reused, pulled straight from
+#    your public proof repo (DannMitton/denigma-wasm-vite-proof). Nothing is
+#    rebuilt, so the test checks the exact bytes that will ship into Ilya.
+#  - CLI side: built fresh here from rpatters1/denigma at the SAME commit
+#    (9221012), fontconfig OFF, so its text-metrics path (FreeType fallback)
+#    matches the WASM's. That leaves the wasm-versus-native boundary as the only
+#    variable, so any diff is attributable to it alone.
+#  - Comparison: both outputs are canonicalised (sorted keys, uniform
+#    whitespace) before diffing, so pretty-vs-compact formatting and key order
+#    never masquerade as content differences. Only real content diverges.
+#
+# Decision rule: zero changed lines on every sample means the WASM matches the
+# CLI and the merge gate is GREEN. Any non-zero diff is inspected (benign
+# metadata versus substantive divergence) before merging.
+#
+# Place at .github/workflows/wasm-cli-mnx-diff.yml, run from the Actions tab,
+# then download the "wasm-cli-mnx-diff-results" artifact and read out/summary.txt.
+
+name: WASM vs CLI MNX diff (pinned 9221012)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # The rpatters1/denigma commit the proof and the pinned WASM were built from.
+  DENIGMA_COMMIT: 9221012b1996ce68ebf2509700e3f84975d8e921
+
+jobs:
+  diff:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out this repo (samples/ and smoke.mjs live here)
+        uses: actions/checkout@v4
+        with:
+          path: self
+
+      - name: Check out denigma source, pinned to the fixed commit
+        uses: actions/checkout@v4
+        with:
+          repository: rpatters1/denigma
+          ref: ${{ env.DENIGMA_COMMIT }}
+          fetch-depth: 0
+          path: denigma-src
+
+      - name: Check out the prebuilt WASM from the proof repo (no rebuild)
+        uses: actions/checkout@v4
+        with:
+          repository: DannMitton/denigma-wasm-vite-proof
+          path: proof
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install build tools (ninja, xxd; deliberately NOT fontconfig)
+        run: sudo apt-get update && sudo apt-get install -y ninja-build xxd
+
+      - name: Show toolchain
+        run: |
+          cmake --version
+          ninja --version
+          c++ --version
+          node --version
+          python3 --version
+
+      # ---- Build the CLI at the pinned commit, fontconfig OFF (matches the WASM) ----
+      - name: Allow the fontconfig-off build to compile (drop -Werror)
+        working-directory: denigma-src
+        run: |
+          set -eo pipefail
+          # With fontconfig off, resolveWithNativeLocked()'s parameters are unused
+          # on Linux and -Werror=unused-parameter would turn that into a hard
+          # error. Two sites: top-level CMakeLists.txt and tests/CMakeLists.txt.
+          # The patch is a no-op if upstream has already removed -Werror.
+          sed -i 's/ -Werror//g' CMakeLists.txt tests/CMakeLists.txt
+          if grep -rn -- '-Werror' CMakeLists.txt tests/CMakeLists.txt; then
+            echo "FAIL: -Werror still present after patch; a line may have changed upstream."
+            exit 1
+          fi
+          echo "OK: -Werror removed (warnings remain, non-fatal)."
+
+      - name: Configure the CLI (fontconfig OFF, dynamic link)
+        working-directory: denigma-src
+        run: |
+          set -eo pipefail
+          cmake -G Ninja -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDENIGMA_FONTCONFIG_INCLUDE_DIR=IGNORE \
+            -DDENIGMA_FONTCONFIG_LIBRARY=IGNORE \
+            2>&1 | tee ../configure-cli.log
+
+      - name: Assert fontconfig really is OFF (matches the WASM text path)
+        run: |
+          set -eo pipefail
+          if grep -q "Text metrics resolver enabled: fontconfig" configure-cli.log; then
+            echo "FAIL: fontconfig was enabled; this would not match the WASM text path."; exit 1
+          fi
+          if grep -q "DENIGMA_FONTCONFIG_LIBRARY:FILEPATH=/" denigma-src/build/CMakeCache.txt; then
+            echo "FAIL: fontconfig library resolved to a real path; not the intended config."; exit 1
+          fi
+          echo "OK: fontconfig disabled (FreeType fallback), matching the WASM."
+
+      - name: Build the CLI
+        working-directory: denigma-src
+        run: cmake --build build --parallel 2
+
+      - name: Locate the CLI binary
+        id: cli
+        run: |
+          set -eo pipefail
+          BIN=$(find denigma-src/build -type f -name denigma | head -n1)
+          [ -n "$BIN" ] || { echo "FAIL: denigma binary not found"; find denigma-src/build -name 'denigma*'; exit 1; }
+          echo "bin=$BIN" >> "$GITHUB_OUTPUT"
+          echo "Located: $BIN"
+          "$BIN" --version || true
+
+      # ---- Stage the prebuilt WASM and the Node driver together ----
+      - name: Stage the WASM driver beside the binaries
+        run: |
+          set -eo pipefail
+          ls -l proof/public/denigma_wasm_mnx.js proof/public/denigma_wasm_mnx.wasm
+          cp self/smoke.mjs proof/public/smoke.mjs
+          echo "Staged smoke.mjs beside the WASM (the glue resolves its .wasm beside itself)."
+
+      # ---- Convert every sample with both engines, then diff canonical MNX ----
+      - name: Convert with CLI and WASM, then diff canonical MNX
+        id: diff
+        run: |
+          set -uo pipefail
+          CLI="$GITHUB_WORKSPACE/${{ steps.cli.outputs.bin }}"
+          WASM_DIR="$GITHUB_WORKSPACE/proof/public"
+          OUT="$GITHUB_WORKSPACE/out"
+          mkdir -p "$OUT/cli_raw" "$OUT/wasm_raw" "$OUT/cli_canon" "$OUT/wasm_canon" "$OUT/diffs"
+
+          # Sample list: "tier|absolute-path".
+          SAMPLES=()
+          shopt -s nullglob
+          for f in "$GITHUB_WORKSPACE"/denigma-src/example_sources/mnx-w3c/*.musx; do
+            SAMPLES+=("simple|$f")
+          done
+          shopt -u nullglob
+          SAMPLES+=("moderate|$GITHUB_WORKSPACE/self/samples/Verdi_-_Simon_Boccanegra_-_Il_lacerato_spirito.musx")
+          SAMPLES+=("stress|$GITHUB_WORKSPACE/self/samples/Kabalevsky_-_Shakespeare_-_T08_No_longer_mourn_for_me_when_I_am_dead.musx")
+
+          if [ "${#SAMPLES[@]}" -le 2 ]; then
+            echo "NOTE: no simple example scores were found at example_sources/mnx-w3c; running on the two named scores only."
+          fi
+
+          printf "%-10s %-50s %s\n" "TIER" "SAMPLE" "MNX LINES CHANGED" | tee "$OUT/summary.txt"
+          printf "%-10s %-50s %s\n" "----" "------" "-----------------" | tee -a "$OUT/summary.txt"
+
+          canon() { python3 -m json.tool --sort-keys "$1" "$2"; }
+
+          any_dirty=0
+          for entry in "${SAMPLES[@]}"; do
+            tier="${entry%%|*}"; src="${entry#*|}"
+            base="$(basename "$src" .musx)"
+            if [ ! -e "$src" ]; then
+              printf "%-10s %-50s %s\n" "$tier" "$base" "MISSING INPUT" | tee -a "$OUT/summary.txt"; any_dirty=1; continue
+            fi
+
+            # CLI -> MNX (pretty default; canonicalised next, so formatting is moot).
+            "$CLI" export "$src" --mnx "$OUT/cli_raw/$base.mnx" --pretty-print --force > "$OUT/cli_raw/$base.log" 2>&1 || true
+            # WASM -> MNX via the Node driver, run from the WASM dir so the glue finds its .wasm.
+            ( cd "$WASM_DIR" && node smoke.mjs "$src" "$OUT/wasm_raw/$base.mnx" ) > "$OUT/wasm_raw/$base.log" 2>&1 || true
+
+            if [ ! -e "$OUT/cli_raw/$base.mnx" ] || [ ! -e "$OUT/wasm_raw/$base.mnx" ]; then
+              printf "%-10s %-50s %s\n" "$tier" "$base" "NO MNX (see logs)" | tee -a "$OUT/summary.txt"; any_dirty=1; continue
+            fi
+
+            # Canonicalise both (sorted keys, uniform whitespace) so only content differs.
+            if ! canon "$OUT/cli_raw/$base.mnx" "$OUT/cli_canon/$base.json" 2>"$OUT/cli_canon/$base.err" \
+               || ! canon "$OUT/wasm_raw/$base.mnx" "$OUT/wasm_canon/$base.json" 2>"$OUT/wasm_canon/$base.err"; then
+              printf "%-10s %-50s %s\n" "$tier" "$base" "INVALID JSON (see canon errs)" | tee -a "$OUT/summary.txt"; any_dirty=1; continue
+            fi
+
+            diff -u "$OUT/cli_canon/$base.json" "$OUT/wasm_canon/$base.json" > "$OUT/diffs/$base.diff" || true
+            n=$(grep -cE '^[+-]' "$OUT/diffs/$base.diff" || true)
+            [ "$n" -ge 2 ] && n=$((n - 2))   # discount the --- / +++ header lines
+            printf "%-10s %-50s %s\n" "$tier" "$base" "$n" | tee -a "$OUT/summary.txt"
+            [ "$n" -gt 0 ] && any_dirty=1
+          done
+
+          echo "" | tee -a "$OUT/summary.txt"
+          if [ "$any_dirty" -eq 0 ]; then
+            echo "RESULT: every canonical diff is empty. The WASM matches the CLI on all samples. Merge gate is GREEN." | tee -a "$OUT/summary.txt"
+          else
+            echo "RESULT: at least one sample differs or failed. Inspect out/diffs and the per-file logs before merging." | tee -a "$OUT/summary.txt"
+          fi
+
+      - name: Show the summary in the run log
+        if: always()
+        run: cat out/summary.txt || echo "(no summary produced)"
+
+      - name: Upload MNX outputs, canonical forms, diffs, logs, and the summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-cli-mnx-diff-results
+          if-no-files-found: error
+          path: |
+            out/
+            configure-cli.log
